@@ -9,55 +9,107 @@
 This is the official code repository for **Local Causal Discovery for Statistically Efficient Causal Inference** by Mátyás Schubert, Tom Claassen and Sara Magliacane.
 
 > [!NOTE]
-> This branch contains all code to reproduce the results presented in the paper. Check out the [main branch](https://github.com/Matyasch/load/tree/main) for a minimal and portable implementation of LOAD.
+> This branch contains a minimal and portable implementation of LOAD. Check out the [aistats2026 branch](https://github.com/Matyasch/load/tree/aistats2026) to reproduce the results presented in the paper.
 
-Experiments can be run using `main.py` with the appropriate parameters. Evaluation functions are implemented in `evaluate.py`.
+The LOAD algorithm is implemented in [`load.py`](load.py) and depends only on `numpy`, as listed in [`requirements.txt`](requirements.txt).
 
-### Dependencies
-Python dependencies can be installed with `pip3 install -r requirements.txt`
+### Examples
+The following minimal examples show how to run `load` and interpret its results. Please also install `causal-learn` to run them.
 
-R dependencies can be installed as follows
-```R
-install.packages("BiocManager")
-BiocManager::install(c("graph", "RBGL", "Rgraphviz"))
-install.packages(c("pcalg", "igraph", "expm", "bnlearn", "dagitty"))
-```
-
-### Example
-Run experiment from terminal:
-```sh
-python3 main.py --connected --observed 100 --exp-degree 2. --citest d_separation --alpha 0.01 --expl-anc --targets 2 --algorithm load
-```
-
-Evaluate experiment in python:
+In the following example, LOAD outputs that the causal effect is identifiable for treatment `0` and outcome `1` and can be estimated with optimal adjustment set `{5,6}`. LOAD returns no adjustment sets for the causal effect of `1` on `0` as it is identified as zero.
 ```py
-import pickle
+from causallearn.utils.cit import CIT
 import numpy as np
-from evaluate import *
+import networkx as nx
 
-with open("results_load.pkl", "rb") as f:
-    results = pickle.load(f)
+from load import load
 
-experiments = {}
-for s in range(100):
-    with open('experiments/{"observed": 10, "latent": 0, "exp_degree": 2.0, "max_degree": 10, "targets": 2, "connected": true, "expl_anc": true, "identifiable": false, "min_adj_size": 0, "samples_num": 0, "discrete": false, "max_classes": 2}/' + str(s) + '.pkl', "rb") as f:
-        exp = pickle.load(f)
-        experiments[exp["id"]] = exp
+# Generate data
+true_dag = np.array(
+    [
+        [0, 1, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0],
+        [1, 0, 0, 0, 1, 0, 0],
+        [1, 0, 0, 0, 1, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+    ]
+)
+dummy_data = np.zeros_like(true_dag)
+true_dag = nx.DiGraph(true_dag)
+nx.draw_circular(true_dag, with_labels=True)
 
-tests = np.sort(get_test_nums(results))[5:95]
-print(f"Tests: {tests.mean()} ± {tests.std()}")
-times = np.sort(get_times(results))[5:95]
-print(f"Times: {times.mean()} ± {times.std()}")
+# Run LOAD
+ci_test = CIT(data=dummy_data, method="d_separation", true_dag=true_dag)
+result = load(data=dummy_data, alpha=0.01, ci_test=ci_test, targets=[1, 0])
+print(result)
 
-true_osets = get_true_osets(experiments)
-f1 = np.sort(evaluate_oset("load", results, true_osets)[2])[5:95]
-print(f"F1: {f1.mean()} ± {f1.std()}")
+>> {'adj_sets': {(0, 1): [{5, 6}]}, 'identifiable': True}
+```
+---
+In the following example, LOAD outputs that the causal effect is not identifiable. For treatment `4` and outcome `1`, the locally valid parent adjustment sets are `{2, 3}` and `{0, 2, 3}`. LOAD returns no adjustment sets for the causal effect of `1` on `4`, which means that it is identified as zero.
+```py
+from causallearn.utils.cit import CIT
+import numpy as np
+import networkx as nx
 
-true_effects = true_causal_effects(experiments, "gaussian")
-samples = generate_samples_from_graphs(experiments, 10000)
-effects = estimate_ates(results, "load", samples, "gaussian")
-distance = np.sort(intervention_distance(effects, true_effects))[5:95]
-print(f"Intervention distance: {distance.mean()} ± {distance.std()}")
+from load import load
+
+# Generate data
+true_dag = np.array(
+    [
+        [0, 1, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0],
+        [1, 0, 0, 0, 1, 0, 0],
+        [1, 0, 0, 0, 1, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+    ]
+)
+dummy_data = np.zeros_like(true_dag)
+true_dag = nx.DiGraph(true_dag)
+nx.draw_circular(true_dag, with_labels=True)
+
+# Run LOAD
+ci_test = CIT(data=dummy_data, method="d_separation", true_dag=true_dag)
+result = load(data=dummy_data, alpha=0.01, ci_test=ci_test, targets=[1, 4])
+print(result)
+
+>> {'adj_sets': {(4, 1): [{2, 3}, {0, 2, 3}]}, 'identifiable': False}
+```
+---
+In the following example, LOAD outputs that the causal effect is not identifiable, and both targets might be treatments. Thus, LOAD outputs the locally valid parent adjustment sets for both treatment `4` and outcome `0`, and treatment `0` and outcome `4`.
+```py
+from causallearn.utils.cit import CIT
+import numpy as np
+import networkx as nx
+
+from load import load
+
+# Generate data
+true_dag = np.array(
+    [
+        [0, 1, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0],
+        [1, 0, 0, 0, 1, 0, 0],
+        [1, 0, 0, 0, 1, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0, 0],
+    ]
+)
+dummy_data = np.zeros_like(true_dag)
+true_dag = nx.DiGraph(true_dag)
+nx.draw_circular(true_dag, with_labels=True)
+
+# Run LOAD
+ci_test = CIT(data=dummy_data, method="d_separation", true_dag=true_dag)
+result = load(data=dummy_data, alpha=0.01, ci_test=ci_test, targets=[0, 4])
+print(result)
+
+>> {'adj_sets': {(0, 4): [{2, 3}], (4, 0): [{2, 3}]}, 'identifiable': False}
 ```
 
 ### Citation

@@ -1,45 +1,11 @@
 from collections import defaultdict
-from itertools import chain, combinations
-from typing import Callable, Sequence
+from itertools import combinations
+from typing import Callable
 
 import numpy as np
 
-from algorithms.orient import v_struc_pc
-from algorithms.pc import skeleton_step
 
-
-def get_locally_valid_parent_sets(g: np.ndarray, x: int) -> Sequence[set[int]]:
-    """
-    Get all locally valid parent sets for a given node in the graph, following
-    the local IDA algorithm (Algorithm 3) in
-    Estimating high-dimensional intervention effects from observational data
-    by Marloes H. Maathuis, Markus Kalisch and Peter Bühlmann
-
-    Args:
-        g (np.ndarray): The local graph of x.
-        x (int): The target node.
-
-    Returns:
-        Sequence[set[int]]: The locally valid parent sets.
-    """
-    parents = set(np.where((g[x] == 1) & (g[:, x] == -1))[0])
-    unoriented = set(np.where((g[x] == -1) & (g[:, x] == -1))[0])
-    skeleton = g != 0
-    np.fill_diagonal(skeleton, True)
-
-    valid_sets = []
-    # for each subset of unoriented neighbors of x
-    for new_parents in chain.from_iterable(
-        combinations(unoriented, r) for r in range(len(unoriented) + 1)
-    ):
-        candidate_set = parents.union(new_parents)
-        # Check if the candidate set is locally valid, i.e., has no NEW v-structure
-        # by checking if all NEW parents are neighbours of all current parents
-        if np.all(skeleton[new_parents, :][:, list(candidate_set)]):
-            valid_sets.append(candidate_set)
-    return valid_sets
-
-
+# Grow-Shrink algorithm for Markov blanket discovery
 def grow_shrink(
     nodes: set,
     target: int,
@@ -79,30 +45,82 @@ def grow_shrink(
     return mb
 
 
-def total_conditioning(
-    nodes: set,
-    target: int,
-    ci_test: Callable[[int, int, list[int]], float],
-    alpha: float,
-) -> set:
+# Learn local structure using the PC algorithm
+def find_unshielded_triples(g: np.ndarray) -> np.ndarray:
     """
-    Find the Markov blanket of a target node in a graph using the Total Conditioning algorithm
-    from Using markov blankets for causal structure learning by
-    Jean-Philippe Pellet and André Elisseeff.
+    Find all unshielded triples in the skeleton in a vectorized way.
 
     Args:
-        nodes (set): All nodes.
-        target (int): Target node for which to find the Markov blanket.
-        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
-        alpha (float): Significance level for the CI test.
+        g (np.ndarray): The skeleton.
+
     Returns:
-        set: The Markov blanket of the target node.
+        np.ndarray: The unshielded triples.
     """
-    mb = set()
-    for n in nodes - {target}:
-        if ci_test(n, target, nodes - {target, n}) < alpha:
-            mb.add(n)
-    return mb
+    i, j = np.where(g != 0)  # i - j
+    k = np.where((g[j] != 0) & (g[i] == 0))  # j - k -/- i
+    # Extract actual indices
+    i, j, k = i[k[0]], j[k[0]], k[1]
+    # Ensure no duplicates
+    mask = i < k
+    return np.column_stack((i[mask], j[mask], k[mask]))
+
+
+def v_struc_pc(
+    skeleton: np.ndarray, sep_set: dict[frozenset, list], bidirected: bool = False
+) -> np.ndarray:
+    """
+    Orient v-structures in the skeleton as in the PC algorithm
+
+    Args:
+        skeleton (np.ndarray): The skeleton to orient.
+        sep_set (dict[frozenset, list]): The separating sets.
+        bidirected (bool): Whether to orient conflicts as bidirected, or overwrite.
+
+    Returns:
+        np.ndarray: The PDAG.
+    """
+    pdag = skeleton.copy()
+    for x, y, z in find_unshielded_triples(skeleton):
+        if all(y not in S for S in sep_set[frozenset((x, z))]):
+            pdag[y, x] = pdag[y, z] = 1  # Orient arrowhead
+            if not bidirected:
+                pdag[x, y] = pdag[z, y] = -1  # Orient tail
+    return pdag
+
+
+def skeleton_step(
+    order: int,
+    g: np.ndarray,
+    ci_test: Callable[[int, int, list[int]], float],
+    alpha: float,
+    sep_set: dict[frozenset, list],
+) -> np.ndarray:
+    """
+    Skeleton step at a given order
+
+    Args:
+        order (int): The order of CI tests.
+        g (np.ndarray): The current skeleton.
+        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
+        alpha (float): Significance level.
+        sep_set (dict[frozenset, list]): The separating sets.
+
+    Returns:
+        np.ndarray: The updated (in-place) skeleton.
+    """
+    for x in range(len(g)):
+        Neigh_x = np.where(g[x, :] != 0)[0]
+        if len(Neigh_x) < order - 1:
+            continue
+        for y in Neigh_x:
+            curr_neigh = np.where(g[x, :] != 0)[0]
+            Neigh_x_noy = np.delete(curr_neigh, np.where(curr_neigh == y))
+            for S in combinations(Neigh_x_noy, order):
+                if ci_test(x, y, S) >= alpha:
+                    g[x, y] = g[y, x] = 0
+                    sep_set[frozenset((x, y))].append(S)
+                    break
+    return g
 
 
 def learn_local_structure(
@@ -158,6 +176,7 @@ def copy_local_structure(g: np.ndarray, observed: set) -> np.ndarray:
     return local
 
 
+# Update global graph with local structure
 def update_graph(g: np.ndarray, target: int, local: np.ndarray) -> np.ndarray:
     """
     Update the graph with the local structure around the target node.
@@ -277,6 +296,7 @@ def meek(g: np.ndarray, sep_set: dict[frozenset, list]) -> np.ndarray:
     return g
 
 
+# Test stopping criterion
 def reach_with_undirected(g: np.ndarray, target: int) -> np.ndarray:
     """
     Find all nodes that can reach the target node with an undirected path.
@@ -295,16 +315,15 @@ def reach_with_undirected(g: np.ndarray, target: int) -> np.ndarray:
     return nodes
 
 
-def mb_by_mb_alg(
+# Main MB-by-MB algorithm
+def mb_by_mb(
     data: np.ndarray,
     ci_test: Callable[[int, int, list[int]], float],
     alpha: float,
     target: int,
-    mb_algorithm: str = "grow_shrink",
     mb: dict[int, set] | None = None,
     L: dict[int, np.ndarray] | None = None,
     sep_set: dict[frozenset, list] | None = None,
-    ignore: Sequence[int] = [],
 ) -> np.ndarray:
     """
     MB-by-MB algorithm for learning the local network around a target node.
@@ -314,22 +333,12 @@ def mb_by_mb_alg(
         ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level.
         target (int): The target node for which to learn the local network.
-        mb_algorithm (str): The algorithm to use for finding the Markov blanket.
         mb (dict[int, set]): Pre-computed Markov blankets of nodes.
         L (dict[int, np.ndarray]): Pre-computed local structures of nodes.
         sep_set (dict[frozenset, list]): Pre-computed separating sets.
-        ignore (Sequence[int]): Nodes to ignore in discovery process.
     Returns:
         np.ndarray: The learned local network around the target node.
     """
-    # Input
-    if mb_algorithm == "grow_shrink":
-        mb_algorithm = grow_shrink
-    elif mb_algorithm == "total_conditioning":
-        mb_algorithm = total_conditioning
-    else:
-        raise ValueError(f"Unknown mb_algorithm: {mb_algorithm}")
-
     mb = mb or dict()
     L = L or dict()
     sep_set = sep_set or defaultdict(list)
@@ -350,7 +359,7 @@ def mb_by_mb_alg(
         x = wait_list.pop(0)
         # Find mb[x]
         if x not in mb:
-            mb[x] = mb_algorithm(V.difference(set(ignore)), x, ci_test, alpha)
+            mb[x] = grow_shrink(V, x, ci_test, alpha)
         mb_x = mb[x].union({x})
         # Add [mb[x] \ done_list \ wait_list] to the tail of wait_list
         wait_list.extend([v for v in mb[x] if v not in list(done_list) + wait_list])
@@ -386,32 +395,3 @@ def mb_by_mb_alg(
 
     # Output: the local network g around the target
     return g
-
-
-def mb_by_mb(
-    data: np.ndarray,
-    ci_test: Callable[[int, int, Sequence[int]], float],
-    alpha: float,
-    treatment: int,
-    outcome: int,
-    mb_algorithm: str = "grow_shrink",
-    **kwargs,
-) -> dict:
-    """
-    MB-by-MB algorithm
-
-    Args:
-        data (np.ndarray): The data matrix.
-        ci_test (Callable): CI test taking x, y and a conditioning set, and returns a p-value.
-        alpha (float): Significance level.
-        treatment (int): The treatment node.
-        outcome (int): The outcome node.
-        mb_algorithm (str): The algorithm to use for finding the Markov blanket.
-        **kwargs: Additional arguments are ignored.
-
-    Returns:
-        dict: Locally valid parent adjustment sets of treatment.
-    """
-    G = mb_by_mb_alg(data, ci_test, alpha, treatment, mb_algorithm)
-    adj_sets = {(treatment, outcome): get_locally_valid_parent_sets(G, treatment)}
-    return {"adj_sets": str(adj_sets)}
