@@ -3,12 +3,8 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from algorithms.load import (
-    get_locally_valid_parent_sets,
-    is_explicit_ancestor,
-    is_possible_ancestor,
-)
-from algorithms.mb_by_mb import mb_by_mb_alg
+from algorithms.load import is_explicit_ancestor, is_possible_ancestor
+from algorithms.mb_by_mb import mb_by_mb_alg, get_locally_valid_parent_sets
 
 
 def mb_by_mb_plus(
@@ -45,17 +41,17 @@ def mb_by_mb_plus(
     ancestry = dict()
     # Determine causal relationships
     if is_explicit_ancestor(t1, t2, G[t1], ci_test, alpha):
-        adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1)
+        adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1, t2)
         ancestry[(t1, t2)] = "explicit"
     elif is_explicit_ancestor(t2, t1, G[t2], ci_test, alpha):
-        adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2)
+        adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2, t1)
         ancestry[(t2, t1)] = "explicit"
     else:
         if is_possible_ancestor(t1, t2, G[t1], ci_test, alpha):
-            adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1)
+            adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1, t2)
             ancestry[(t1, t2)] = "possible"
         if is_possible_ancestor(t2, t1, G[t2], ci_test, alpha):
-            adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2)
+            adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2, t1)
             ancestry[(t2, t1)] = "possible"
 
     return {"adj_sets": str(adj_sets), "ancestry": str(ancestry)}

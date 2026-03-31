@@ -9,6 +9,8 @@ from rpy2.robjects import default_converter, globalenv, numpy2ri, r
 from rpy2.rinterface_lib.callbacks import logger as rpy2_logger
 import logging
 
+from algorithms.mb_by_mb import get_locally_valid_parent_sets
+
 rpy2_logger.setLevel(logging.ERROR)
 r.source("evaluate.R")
 r.source("generate_data.R")
@@ -26,7 +28,7 @@ def generate_samples_from_graph(
             samples_num=samples_num,
             cpt=exp["cpt"],
         )
-        return np.array(suff_stat["dm"])
+        return np.array(suff_stat[0])
 
 
 def generate_samples_from_graphs(
@@ -209,7 +211,7 @@ def get_oset(project: str, h: dict, treatment: int, outcome: int):
             ]
         else:
             est_osets = None
-    elif project in ["load", "load_oracle"]:
+    elif project == "local_optimal" or project.startswith("load"):
         adj_sets = eval(h["adj_sets"])
         if h["identifiable"] and (treatment, outcome) in adj_sets:
             est_osets = adj_sets[(treatment, outcome)]
@@ -367,7 +369,9 @@ def get_adj_sets(project: str, h: dict, t1: int, t2: int):
             if oset != None:  # identifiable
                 return [oset]
             else:  # unidentifiable, fall back to local IDA
-                return get_locally_valid_sets(t1, amat)
+                amat = -amat.copy()
+                amat[np.logical_and(amat == 0, amat.T == -1)] = 1
+                return get_locally_valid_parent_sets(amat, t1, t2)
         else:
             return None
     elif project in ["mb_by_mb", "ldecc", "mb_by_mb_plus", "ldecc_plus"]:
@@ -384,7 +388,7 @@ def get_adj_sets(project: str, h: dict, t1: int, t2: int):
             ]
         else:
             return None
-    elif project in ["load", "load_oracle"]:
+    elif project == "local_optimal" or project.startswith("load"):
         adj_sets: dict = eval(h["adj_sets"])
         return adj_sets.get((t1, t2), None)
     else:

@@ -1,10 +1,10 @@
 from collections import defaultdict
-from itertools import chain, combinations
 from typing import Callable, NamedTuple, Sequence
 
 import numpy as np
 
-from algorithms.mb_by_mb import mb_by_mb_alg
+from algorithms.mb_by_mb import mb_by_mb_alg, get_locally_valid_parent_sets, grow_shrink
+from algorithms.cmb import cmb_alg
 
 
 class Neighbors(NamedTuple):
@@ -119,45 +119,13 @@ def is_amenable(
     return ci_test(v, y, neighbors.parents | {x}) >= alpha
 
 
-def get_locally_valid_parent_sets(g: np.ndarray, x: int) -> Sequence[set[int]]:
-    """
-    Get all locally valid parent sets for a given node in the graph, following
-    the local IDA algorithm (Algorithm 3) in
-    Estimating high-dimensional intervention effects from observational data
-    by Marloes H. Maathuis, Markus Kalisch and Peter Bühlmann
-
-    Args:
-        g (np.ndarray): The local graph of x.
-        x (int): The target node.
-
-    Returns:
-        Sequence[set[int]]: The locally valid parent sets.
-    """
-    neighbors = get_neighbors(g, x)
-    skeleton = g != 0
-    np.fill_diagonal(skeleton, True)
-
-    valid_sets = []
-    # for each subset of unoriented neighbors of x
-    for new_parents in chain.from_iterable(
-        combinations(neighbors.unoriented, r)
-        for r in range(len(neighbors.unoriented) + 1)
-    ):
-        candidate_set = neighbors.parents.union(new_parents)
-        # Check if the candidate set is locally valid, i.e., has no NEW v-structure
-        # by checking if all NEW parents are neighbours of all current parents
-        if np.all(skeleton[new_parents, :][:, list(candidate_set)]):
-            valid_sets.append(candidate_set)
-    return valid_sets
-
-
 def load(
     data: np.ndarray,
     ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
     targets: Sequence[int],
+    lcd_algorithm: str = "mb_by_mb",
     mb_algorithm: str = "grow_shrink",
-    ignore: Sequence[int] = [],
     **kwargs,
 ) -> dict:
     """
@@ -168,26 +136,28 @@ def load(
         ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level.
         targets (Sequence[int]): The target nodes.
+        lcd_algorithm (str): The local causal discovery algorithm to use.
         mb_algorithm (str): The algorithm to use for finding the Markov blanket.
-        ignore (Sequence[int]): Nodes to ignore in discovery process.
         **kwargs: Additional keyword arguments are ignored.
     Returns:
         dict: Adjustment sets and a boolean indicating if the causal effect is identifiable.
     """
+    if lcd_algorithm == "mb_by_mb":
+        lcd_alg = mb_by_mb_alg
+    elif lcd_algorithm == "cmb":
+        lcd_alg = cmb_alg
+    else:
+        raise ValueError(f"Unknown local causal discovery algorithm: {lcd_algorithm}")
+
     MB = dict()
     L = dict()
     G = dict()
     sep_set = defaultdict(list)
-
     adj_sets = dict()
 
     t1, t2 = targets
-    G[t1] = mb_by_mb_alg(
-        data, ci_test, alpha, t1, mb_algorithm, MB, L, sep_set, ignore=ignore
-    )
-    G[t2] = mb_by_mb_alg(
-        data, ci_test, alpha, t2, mb_algorithm, MB, L, sep_set, ignore=ignore
-    )
+    G[t1] = lcd_alg(data, ci_test, alpha, t1, mb_algorithm, MB, L, sep_set)
+    G[t2] = lcd_alg(data, ci_test, alpha, t2, mb_algorithm, MB, L, sep_set)
 
     # Determine causal relationship
     if is_explicit_ancestor(t1, t2, G[t1], ci_test, alpha):
@@ -196,48 +166,47 @@ def load(
         treatment, outcome = t2, t1
     else:
         if is_possible_ancestor(t1, t2, G[t1], ci_test, alpha):
-            adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1)
+            adj_sets[(t1, t2)] = get_locally_valid_parent_sets(G[t1], t1, t2)
         if is_possible_ancestor(t2, t1, G[t2], ci_test, alpha):
-            adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2)
+            adj_sets[(t2, t1)] = get_locally_valid_parent_sets(G[t2], t2, t1)
         return {
             "adj_sets": str(adj_sets),
             "identifiable": False,
-            "id_tests": ci_test.get_tests_per_order().tolist(),
+            "expl_an": None,
+            "poss_an": [t1 for t1, _ in adj_sets],
+            "step": 1,
         }
 
     # Check if amenable
     unoriented = get_neighbors(G[treatment], treatment).unoriented
     for v in unoriented:
-        G[v] = mb_by_mb_alg(data, ci_test, alpha, v, mb_algorithm, MB, L, sep_set)
+        G[v] = lcd_alg(data, ci_test, alpha, v, mb_algorithm, MB, L, sep_set)
         if not is_amenable(treatment, outcome, v, G[v], ci_test, alpha):
-            adj_sets[(treatment, outcome)] = get_locally_valid_parent_sets(
-                G[treatment], treatment
-            )
+            local_sets = get_locally_valid_parent_sets(G[treatment], treatment, outcome)
+            adj_sets[(treatment, outcome)] = local_sets
             return {
                 "adj_sets": str(adj_sets),
                 "identifiable": False,
-                "id_tests": ci_test.get_tests_per_order().tolist(),
+                "expl_an": treatment,
+                "poss_an": [],
+                "step": 2,
             }
-    id_tests = ci_test.get_tests_per_order().tolist()
 
-    # Identify explicit descendants of treatment
-    desc = set()
+    # Identify possible descendants of treatment
+    pdesc = set()
     for v in set(range(data.shape[1])) - {treatment, outcome}:
-        if is_explicit_ancestor(treatment, v, G[treatment], ci_test, alpha):
-            desc.add(v)
-            G[v] = mb_by_mb_alg(data, ci_test, alpha, v, mb_algorithm, MB, L, sep_set)
+        if is_possible_ancestor(treatment, v, G[treatment], ci_test, alpha):
+            pdesc.add(v)
 
-    # Identify explicit mediators between treatment and outcome
-    meds = set()
-    for v in desc:
-        if is_explicit_ancestor(v, outcome, G[v], ci_test, alpha):
-            meds.add(v)
-
-    # Identify optimal adjustment set
-    oset = set()
-    for med in meds | {outcome}:
-        oset |= get_neighbors(G[med], med).parents
-    oset -= meds | {treatment}
+    # Obtain optimal adjustment set via forbidden projection
+    known_mb = get_neighbors(G[outcome], outcome).parents - pdesc
+    oset = grow_shrink(data, outcome, ci_test, alpha, pdesc, known_mb) - {treatment}
 
     adj_sets[(treatment, outcome)] = [oset]
-    return {"adj_sets": str(adj_sets), "identifiable": True, "id_tests": id_tests}
+    return {
+        "adj_sets": str(adj_sets),
+        "identifiable": True,
+        "expl_an": treatment,
+        "poss_an": [],
+        "step": 4,
+    }

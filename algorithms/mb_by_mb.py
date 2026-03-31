@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 from itertools import chain, combinations
 from typing import Callable, Sequence
 
@@ -6,9 +6,12 @@ import numpy as np
 
 from algorithms.orient import v_struc_pc
 from algorithms.pc import skeleton_step
+from algorithms.s2tmb import s2tmb
 
 
-def get_locally_valid_parent_sets(g: np.ndarray, x: int) -> Sequence[set[int]]:
+def get_locally_valid_parent_sets(
+    g: np.ndarray, treatment: int, outcome: int
+) -> list[set[int]]:
     """
     Get all locally valid parent sets for a given node in the graph, following
     the local IDA algorithm (Algorithm 3) in
@@ -16,55 +19,60 @@ def get_locally_valid_parent_sets(g: np.ndarray, x: int) -> Sequence[set[int]]:
     by Marloes H. Maathuis, Markus Kalisch and Peter Bühlmann
 
     Args:
-        g (np.ndarray): The local graph of x.
-        x (int): The target node.
+        g (np.ndarray): The graph.
+        treatment (int): The treatment node.
+        outcome (int): The outcome node.
 
     Returns:
-        Sequence[set[int]]: The locally valid parent sets.
+        list[set[int]]: The locally valid parent sets.
     """
-    parents = set(np.where((g[x] == 1) & (g[:, x] == -1))[0])
-    unoriented = set(np.where((g[x] == -1) & (g[:, x] == -1))[0])
+    parents = set(np.where((g[treatment] == 1) & (g[:, treatment] == -1))[0])
+    siblings = set(np.where((g[treatment] == -1) & (g[:, treatment] == -1))[0])
+    siblings = siblings - {outcome}
     skeleton = g != 0
     np.fill_diagonal(skeleton, True)
-
-    valid_sets = []
-    # for each subset of unoriented neighbors of x
-    for new_parents in chain.from_iterable(
-        combinations(unoriented, r) for r in range(len(unoriented) + 1)
-    ):
-        candidate_set = parents.union(new_parents)
-        # Check if the candidate set is locally valid, i.e., has no NEW v-structure
-        # by checking if all NEW parents are neighbours of all current parents
-        if np.all(skeleton[new_parents, :][:, list(candidate_set)]):
-            valid_sets.append(candidate_set)
+    valid_sets = [parents]
+    for l in range(1, len(siblings) + 1):
+        for sib in combinations(siblings, l):
+            candidate_set = set(sib) | parents
+            if np.all(skeleton[list(sib), :][:, list(candidate_set)]):
+                valid_sets.append(candidate_set)
     return valid_sets
 
 
 def grow_shrink(
-    nodes: set,
+    data: np.ndarray,
     target: int,
     ci_test: Callable[[int, int, list[int]], float],
     alpha: float,
+    ignore: set | None = None,
+    known_mb: set | None = None,
 ) -> set:
     """
     Find the Markov blanket of a target node in a graph using the Grow-Shrink algorithm.
-    Adapted from https://github.com/acmi-lab/local-causal-discovery.
 
     Args:
-        nodes (set): All nodes.
+        data (np.ndarray): The data matrix.
         target (int): Target node for which to find the Markov blanket.
         ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level for the CI test.
+        ignore (set | None): Nodes to ignore.
+        known_mb (set | None): Nodes known to be in the Markov blanket.
     Returns:
         set: The Markov blanket of the target node.
     """
-    mb = set()
+    if ignore is None:
+        ignore = set()
+    if known_mb is None:
+        known_mb = set()
+    nodes = set(range(data.shape[1])) - {target} - ignore
+    mb = known_mb.copy()
     # Forward pass
     cont = True
     while cont:
         cont = False
         mb_copy = set(mb)
-        nodes_to_check = nodes - {target} - mb_copy
+        nodes_to_check = nodes - mb_copy
         for n in nodes_to_check:
             if ci_test(n, target, mb - {n}) < alpha:
                 mb.add(n)
@@ -72,7 +80,7 @@ def grow_shrink(
 
     # Backward pass
     mb_copy = set(mb)
-    for n in mb_copy:
+    for n in mb_copy - known_mb:
         if ci_test(n, target, mb - {n}) >= alpha:
             mb.remove(n)
 
@@ -80,10 +88,12 @@ def grow_shrink(
 
 
 def total_conditioning(
-    nodes: set,
+    data: np.ndarray,
     target: int,
     ci_test: Callable[[int, int, list[int]], float],
     alpha: float,
+    ignore: set | None = None,
+    known_mb: set | None = None,
 ) -> set:
     """
     Find the Markov blanket of a target node in a graph using the Total Conditioning algorithm
@@ -91,22 +101,29 @@ def total_conditioning(
     Jean-Philippe Pellet and André Elisseeff.
 
     Args:
-        nodes (set): All nodes.
+        data (np.ndarray): The data matrix.
         target (int): Target node for which to find the Markov blanket.
         ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level for the CI test.
+        ignore (set | None): Nodes to ignore.
+        known_mb (set | None): Nodes known to be in the Markov blanket.
     Returns:
         set: The Markov blanket of the target node.
     """
-    mb = set()
-    for n in nodes - {target}:
+    if ignore is None:
+        ignore = set()
+    if known_mb is None:
+        known_mb = set()
+    nodes = set(range(data.shape[1])) - {target} - ignore
+    mb = known_mb.copy()
+    for n in nodes - known_mb:
         if ci_test(n, target, nodes - {target, n}) < alpha:
             mb.add(n)
     return mb
 
 
 def learn_local_structure(
-    nodes: set,
+    data: np.ndarray,
     observed: set,
     sep_set: dict[frozenset, list],
     ci_test: Callable[[int, int, list[int]], float],
@@ -116,7 +133,7 @@ def learn_local_structure(
     Learn the local structure over a set of observed nodes using the PC algorithm.
 
     Args:
-        nodes (set): All nodes.
+        data (np.ndarray): The data matrix.
         observed (set): The observed nodes.
         sep_set (dict[frozenset, list]): The separating sets.
         ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
@@ -125,6 +142,7 @@ def learn_local_structure(
         np.ndarray: The adjacency matrix of the learned local structure.
     """
     # Initialization
+    nodes = set(range(data.shape[1]))
     g = np.full((len(nodes), len(nodes)), -1, dtype=int)
     np.fill_diagonal(g, 0)
     ignore = list(nodes.difference(observed))
@@ -279,7 +297,7 @@ def meek(g: np.ndarray, sep_set: dict[frozenset, list]) -> np.ndarray:
 
 def reach_with_undirected(g: np.ndarray, target: int) -> np.ndarray:
     """
-    Find all nodes that can reach the target node with an undirected path.
+    Find all nodes that can reach the target node with an undirected path with BFS.
     Args:
         g (np.ndarray): The partially directed graph.
         target (int): The target node.
@@ -287,12 +305,23 @@ def reach_with_undirected(g: np.ndarray, target: int) -> np.ndarray:
         np.ndarray: An array of nodes that can reach the target node with an undirected path
     """
     undir = (g == -1) & (g.T == -1)
-    np.fill_diagonal(undir, 1)
-    reach = np.linalg.matrix_power(undir, undir.shape[0] - 1)
-    mask = reach[target] != 0
-    mask[target] = False
-    nodes = np.where(mask)[0]
-    return nodes
+
+    # BFS from target
+    visited = np.zeros(g.shape[0], dtype=bool)
+    visited[target] = True
+    queue = deque([target])
+
+    while queue:
+        node = queue.popleft()
+        # Get all undirected neighbors of current node
+        neighbors = np.where(undir[node])[0]
+        for nb in neighbors:
+            if not visited[nb]:
+                visited[nb] = True
+                queue.append(nb)
+
+    visited[target] = False
+    return set(np.where(visited)[0])
 
 
 def mb_by_mb_alg(
@@ -304,7 +333,7 @@ def mb_by_mb_alg(
     mb: dict[int, set] | None = None,
     L: dict[int, np.ndarray] | None = None,
     sep_set: dict[frozenset, list] | None = None,
-    ignore: Sequence[int] = [],
+    ignore: set = set(),
 ) -> np.ndarray:
     """
     MB-by-MB algorithm for learning the local network around a target node.
@@ -318,7 +347,7 @@ def mb_by_mb_alg(
         mb (dict[int, set]): Pre-computed Markov blankets of nodes.
         L (dict[int, np.ndarray]): Pre-computed local structures of nodes.
         sep_set (dict[frozenset, list]): Pre-computed separating sets.
-        ignore (Sequence[int]): Nodes to ignore in discovery process.
+        ignore (set): Nodes to ignore.
     Returns:
         np.ndarray: The learned local network around the target node.
     """
@@ -327,34 +356,38 @@ def mb_by_mb_alg(
         mb_algorithm = grow_shrink
     elif mb_algorithm == "total_conditioning":
         mb_algorithm = total_conditioning
+    elif mb_algorithm == "s2tmb":
+        mb_algorithm = s2tmb
     else:
         raise ValueError(f"Unknown mb_algorithm: {mb_algorithm}")
 
-    mb = mb or dict()
-    L = L or dict()
-    sep_set = sep_set or defaultdict(list)
-    V = set(range(data.shape[1]))
+    if mb is None:
+        mb = dict()
+    if L is None:
+        L = dict()
+    if sep_set is None:
+        sep_set = defaultdict(list)
 
     # 1. Initialization
     # Nodes whose MBs have been found
     done_list = set()
     # Nodes whose MBs will be found
-    wait_list = [target]
+    wait_list = deque([target])
     # The constructed local network around target
     # with -1 for edge tail, 1 for edge head, and 0 for no edge
-    g = np.zeros((len(V), len(V)), dtype=int)
+    g = np.zeros((data.shape[1], data.shape[1]), dtype=int)
 
     # 2. Repeat
     while len(wait_list) > 0:  # 7. Until wait_list is empty
         # Take a node x from the head of wait_list
-        x = wait_list.pop(0)
+        x = wait_list.popleft()
         # Find mb[x]
         if x not in mb:
-            mb[x] = mb_algorithm(V.difference(set(ignore)), x, ci_test, alpha)
+            mb[x] = mb_algorithm(data, x, ci_test, alpha, ignore)
         mb_x = mb[x].union({x})
-        # Add [mb[x] \ done_list \ wait_list] to the tail of wait_list
-        wait_list.extend([v for v in mb[x] if v not in list(done_list) + wait_list])
-        # Add x to done_list
+        # Add [mb[x] \ done_nodes \ wait_list] to the tail of wait_list
+        wait_list.extend(mb[x] - done_list - set(wait_list))
+        # Add x to done_nodes
         done_list.add(x)
 
         # 3. Learn the local structure L[x] over mb+(x)
@@ -363,7 +396,7 @@ def mb_by_mb_alg(
             pass
         # If mb+(x) is a subset of mb+(n) for some n in done_list
         elif (
-            n := next((n for n in done_list if n != x and mb_x < mb[n] | {n}), None)
+            n := next((n for n in done_list if n != x and mb_x <= mb[n] | {n}), None)
         ) is not None:
             # Set L[x] equal to the substructure of L[n] over mb+(x)
             L[x] = copy_local_structure(L[n], mb_x)
@@ -373,7 +406,7 @@ def mb_by_mb_alg(
             L[x] = copy_local_structure(g, mb_x)
         else:
             # learn L[x] from observed data of mb[x]+
-            L[x] = learn_local_structure(V, mb_x, sep_set, ci_test, alpha)
+            L[x] = learn_local_structure(data, mb_x, sep_set, ci_test, alpha)
 
         # 4. Put the edges connected to x and the v-structures containing x in L[x] to g
         g = update_graph(g, x, L[x])
@@ -382,7 +415,7 @@ def mb_by_mb_alg(
 
         # 6. Remove all nodes from wait_list whose paths to target in g are blocked by directed edges.
         connected = reach_with_undirected(g, target)
-        wait_list = [w for w in wait_list if w in connected]
+        wait_list = deque(v for v in wait_list if v in connected)
 
     # Output: the local network g around the target
     return g
@@ -413,5 +446,6 @@ def mb_by_mb(
         dict: Locally valid parent adjustment sets of treatment.
     """
     G = mb_by_mb_alg(data, ci_test, alpha, treatment, mb_algorithm)
-    adj_sets = {(treatment, outcome): get_locally_valid_parent_sets(G, treatment)}
+    local_sets = get_locally_valid_parent_sets(G, treatment, outcome)
+    adj_sets = {(treatment, outcome): local_sets}
     return {"adj_sets": str(adj_sets)}

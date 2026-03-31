@@ -42,7 +42,7 @@ generate_dag <- function(nodes, exp_degree, max_degree, connected = TRUE) {
             )
         }
     }
-    g <- igraph::as.directed(g, mode = "acyclic")
+    g <- igraph::as_directed(g, mode = "acyclic")
     return(g)
 }
 
@@ -234,26 +234,8 @@ generate_suffstat <- function(dag, dm = NULL) {
 }
 
 
-sample_labels <- function(observed, latent, targets) {
-    #' Sample labels
-    #'
-    #' Sample random node labels such that the targets are always observed.
-    #' @param observed The number of observed nodes.
-    #' @param latent The number of latent nodes.
-    #' @param targets The target nodes.
-    #' @return The sampled node labels.
-
-    target_labels <- sample(observed, length(targets))
-    other_obs <- setdiff(seq_len(observed), target_labels)
-    other_labels <- sample(c(other_obs, observed + seq_len(latent)))
-    labels <- vector("numeric", observed + latent)
-    labels[targets] <- target_labels
-    labels[-targets] <- other_labels
-    return(labels)
-}
-
 # Main function
-generate_data <- function(observed, latent = 0, exp_degree, max_degree, targets,
+generate_data <- function(nodes, exp_degree, max_degree, targets,
                           seed = 0, connected = TRUE, expl_anc = FALSE,
                           identifiable = FALSE, min_adj_size = 0,
                           samples_num = 0, discrete = FALSE, max_classes = 2) {
@@ -278,7 +260,6 @@ generate_data <- function(observed, latent = 0, exp_degree, max_degree, targets,
     #' and conditional probability table if discrete data is generated.
 
     set.seed(seed)
-    nodes <- observed + latent
     n_targets <- targets
     # Sample targets
     while (TRUE) {
@@ -295,7 +276,7 @@ generate_data <- function(observed, latent = 0, exp_degree, max_degree, targets,
         if (!is.null(targets)) break
     }
     # Shuffle node labels
-    labels <- sample_labels(observed, latent, targets)
+    labels <- sample(nodes)
     # Sample edge weights
     w <- runif(nodes**2, 0.5, 3) * (rbinom(nodes**2, 1, 0.5) * 2 - 1)
     amat <- igraph::as_adjacency_matrix(ig) * matrix(w, nrow = nodes)
@@ -326,8 +307,6 @@ generate_data <- function(observed, latent = 0, exp_degree, max_degree, targets,
     treatment <- as.character(labels[targets[1]])
     outcome <- as.character(labels[targets[2]])
     targets <- as.character(sort(labels[targets]))
-    # Remove data for latent nodes
-    data <- data[, 1:(ncol(data) - latent)]
     suffStat <- generate_suffstat(dag, data)
     return(list(
         "suffStat" = suffStat,

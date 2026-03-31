@@ -74,8 +74,7 @@ def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--exp", type=int, default=100, help="Number of experiments.")
     parser.add_argument("--file", type=str, help="Data file path.")
-    parser.add_argument("--observed", type=int, help="Number of observed nodes.")
-    parser.add_argument("--latent", type=int, default=0, help="Number of latent nodes.")
+    parser.add_argument("--nodes", type=int, help="Number of nodes.")
     parser.add_argument("--targets", type=int, default=4, help="Number of targets.")
     parser.add_argument(
         "--exp-degree", type=float, default=3.0, help="Expected degree."
@@ -114,14 +113,18 @@ def parse_args():
         help="Causal discovery algorithm.",
     )
     parser.add_argument(
+        "--lcd-algorithm",
+        type=str,
+        help="The local causal discovery algorithm to use.",
+        default="mb_by_mb",
+        choices=["mb_by_mb", "cmb"],
+    )
+    parser.add_argument(
         "--mb-algorithm",
         type=str,
         help="The algorithm to use for finding the Markov blanket.",
         default="grow_shrink",
-        choices=["grow_shrink", "total_conditioning"],
-    )
-    parser.add_argument(
-        "--filter", action="store_true", help="Pre-filter with SNAP(0)."
+        choices=["grow_shrink", "total_conditioning", "s2tmb"],
     )
     parser.add_argument("--seed", type=int, default=0, help="Global seed.")
     parser.add_argument("--cont", type=str, help="Wandb ID of run to continue.")
@@ -136,7 +139,6 @@ def run_algorithm(
     algorithm: str,
     ci_test: str,
     alpha: float,
-    filter: bool = False,
     **kwargs,
 ):
     """
@@ -149,7 +151,6 @@ def run_algorithm(
         algorithm (str): The algorithm to run.
         ci_test (str): Name of the conditional independence test to use.
         alpha (float): The significance level for the CI tests.
-        filter (bool): Whether to pre-filter with SNAP(0).
         **kwargs: Additional keyword arguments.
 
     Returns:
@@ -158,23 +159,14 @@ def run_algorithm(
     ci_test = CountingTest(data, ci_test, **kwargs)
     start = perf_counter()
     # Run algorithm
-    try:
-        if filter:
-            res = snap(data, ci_test, 0.05, targets, 0)
-            ignore = np.setdiff1d(np.arange(data.shape[1]), res["poss_anc"])
-        else:
-            ignore = []
-        result = ALGORITHMS[algorithm](
-            data=data,
-            ci_test=ci_test,
-            alpha=alpha,
-            targets=targets,
-            ignore=ignore,
-            **kwargs,
-        )
-        result["failed"] = False
-    except Exception:
-        result = {"failed": True}
+    result = ALGORITHMS[algorithm](
+        data=data,
+        ci_test=ci_test,
+        alpha=alpha,
+        targets=targets,
+        ignore=[],
+        **kwargs,
+    )
     # Log statistics
     result["time"] = perf_counter() - start
     result["id"] = id
@@ -189,7 +181,6 @@ def experiment(args, s: int) -> dict:
 
     Args:
         args (Namespace): The command line arguments.
-        done (dict): A dictionary of completed experiments.
         s (int): The seed for the experiment.
 
     Returns:
@@ -198,8 +189,7 @@ def experiment(args, s: int) -> dict:
     data = generate_data(
         seed=args.seed + s,
         file=args.file,
-        observed=args.observed,
-        latent=args.latent,
+        nodes=args.nodes,
         exp_degree=float(args.exp_degree),
         max_degree=args.max_degree,
         targets=args.targets,
@@ -216,10 +206,10 @@ def experiment(args, s: int) -> dict:
     return run_algorithm(
         algorithm=args.algorithm,
         ci_test=args.citest,
+        lcd_algorithm=args.lcd_algorithm,
         mb_algorithm=args.mb_algorithm,
         alpha=args.alpha,
-        observed=args.observed,  # latent models
-        filter=args.filter,
+        nodes=args.nodes,
         **data,
     )
 

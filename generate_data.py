@@ -6,7 +6,7 @@ import numpy as np
 import networkx as nx
 from rpy2.robjects import r
 
-r.source("R/generate_data.R")
+r.source("generate_data.R")
 
 
 def save_data(data: dict, seed: int, **kwargs):
@@ -42,11 +42,10 @@ def load_data(seed: int, **kwargs) -> dict:
 
 def generate_data(
     seed: int,
-    observed: int,
+    nodes: int,
     exp_degree: float,
     max_degree: int,
     targets: int,
-    latent: int = 0,
     connected: bool = True,
     expl_anc: bool = False,
     identifiable: bool = False,
@@ -63,8 +62,7 @@ def generate_data(
     Args:
         seed (int): The seed for the random number generator.
         file (str | None): The file to load data from.
-        observed (int): Number of observed nodes.
-        latent (int): Number of latent nodes.
+        nodes (int): Number of nodes.
         exp_degree (float): Expected degree of the graph.
         max_degree (int): Maximum degree of the graph.
         targets (int): Number of target nodes.
@@ -83,8 +81,7 @@ def generate_data(
         gen_func = r["generate_data"]
         kwargs = {
             "seed": seed,
-            "observed": observed,
-            "latent": latent,
+            "nodes": nodes,
             "exp_degree": exp_degree,
             "max_degree": max_degree,
             "targets": targets,
