@@ -1,17 +1,26 @@
-from collections import defaultdict
+"""
+MB-by-MB algorithm for local causal discovery.
+
+Implements the MB-by-MB local causal discovery algorithm.
+Reference: Wang et al., "Discovering and orienting the edges connected
+to a target variable in a DAG via a sequential local learning approach"
+(Computational statistics & data analysis, 2014).
+"""
+
+from collections import deque
 from itertools import combinations
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 
 
 # Grow-Shrink algorithm for Markov blanket discovery
 def grow_shrink(
-    nodes: set,
+    nodes: set[int],
     target: int,
-    ci_test: Callable[[int, int, list[int]], float],
+    ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
-) -> set:
+) -> set[int]:
     """
     Find the Markov blanket of a target node in a graph using the Grow-Shrink algorithm.
     Adapted from https://github.com/acmi-lab/local-causal-discovery.
@@ -19,7 +28,7 @@ def grow_shrink(
     Args:
         nodes (set): All nodes.
         target (int): Target node for which to find the Markov blanket.
-        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
+        ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level for the CI test.
     Returns:
         set: The Markov blanket of the target node.
@@ -81,7 +90,7 @@ def v_struc_pc(
     """
     pdag = skeleton.copy()
     for x, y, z in find_unshielded_triples(skeleton):
-        if all(y not in S for S in sep_set[frozenset((x, z))]):
+        if all(y not in S for S in sep_set.get(frozenset((x, z)), [()])):
             pdag[y, x] = pdag[y, z] = 1  # Orient arrowhead
             if not bidirected:
                 pdag[x, y] = pdag[z, y] = -1  # Orient tail
@@ -91,17 +100,17 @@ def v_struc_pc(
 def skeleton_step(
     order: int,
     g: np.ndarray,
-    ci_test: Callable[[int, int, list[int]], float],
+    ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
     sep_set: dict[frozenset, list],
 ) -> np.ndarray:
     """
-    Skeleton step at a given order
+    Skeleton step at a given order.
 
     Args:
         order (int): The order of CI tests.
         g (np.ndarray): The current skeleton.
-        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
+        ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level.
         sep_set (dict[frozenset, list]): The separating sets.
 
@@ -109,25 +118,24 @@ def skeleton_step(
         np.ndarray: The updated (in-place) skeleton.
     """
     for x in range(len(g)):
-        Neigh_x = np.where(g[x, :] != 0)[0]
-        if len(Neigh_x) < order - 1:
+        if np.sum(g[x, :] != 0) -1 < order:
             continue
-        for y in Neigh_x:
-            curr_neigh = np.where(g[x, :] != 0)[0]
-            Neigh_x_noy = np.delete(curr_neigh, np.where(curr_neigh == y))
-            for S in combinations(Neigh_x_noy, order):
+        for y in np.where(g[x, :] != 0)[0]:
+            adj_x_no_y = np.where((g[x, :] != 0) & (np.arange(len(g)) != y))[0]
+            for S in combinations(adj_x_no_y, order):
                 if ci_test(x, y, S) >= alpha:
                     g[x, y] = g[y, x] = 0
-                    sep_set[frozenset((x, y))].append(S)
+                    pair = frozenset((x, y))
+                    sep_set[pair] = sep_set.get(pair, []) + [frozenset(S)]
                     break
     return g
 
 
 def learn_local_structure(
-    nodes: set,
+    nodes: set[int],
     observed: set,
     sep_set: dict[frozenset, list],
-    ci_test: Callable[[int, int, list[int]], float],
+    ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
 ) -> np.ndarray:
     """
@@ -137,7 +145,7 @@ def learn_local_structure(
         nodes (set): All nodes.
         observed (set): The observed nodes.
         sep_set (dict[frozenset, list]): The separating sets.
-        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
+        ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level for the CI test.
     Returns:
         np.ndarray: The adjacency matrix of the learned local structure.
@@ -159,7 +167,7 @@ def learn_local_structure(
     return g
 
 
-def copy_local_structure(g: np.ndarray, observed: set) -> np.ndarray:
+def copy_local_structure(g: np.ndarray, observed: list[int]) -> np.ndarray:
     """
     Create a copy of the local structure over the observed nodes.
 
@@ -171,7 +179,6 @@ def copy_local_structure(g: np.ndarray, observed: set) -> np.ndarray:
         np.ndarray: A copy of the local structure.
     """
     local = np.zeros_like(g, dtype=int)
-    observed = list(observed)
     local[np.ix_(observed, observed)] = g[np.ix_(observed, observed)]
     return local
 
@@ -205,6 +212,80 @@ def update_graph(g: np.ndarray, target: int, local: np.ndarray) -> np.ndarray:
     return g
 
 
+def _meek_rule1(g: np.ndarray, sep_set: dict[frozenset, list]) -> bool:
+    """
+    For (a -> b - c) in g,
+    if g.sepset[a, c] exists and b in g.sepset[a, c], orient b -> c.
+
+    Args:
+        g (np.ndarray): The graph to orient.
+    Returns:
+        bool: Whether the graph was changed.
+    """
+    a, b = np.where((g == -1) & (g.T == 1))  # a -> b
+    c = np.where(((g[b] == -1) & (g.T[b] == -1)) & (g[a] == 0))  # b - c  # a -/- c
+    # Extract actual indices
+    a, b, c = a[c[0]], b[c[0]], c[1]
+    # Orient as b -> c
+    changed = False
+    for a_, b_, c_ in zip(a, b, c):
+        if frozenset((a_, c_)) in sep_set and all(
+            b_ in S for S in sep_set[frozenset((a_, c_))]
+        ):
+            g[c_, b_] = 1
+            changed = True
+
+    return changed
+
+def _meek_rule2(g: np.ndarray) -> bool:
+    """
+    For (a -> b -> c - a) in g, orient a -> c.
+    Args:
+        g (np.ndarray): The graph to orient.
+    Returns:
+        bool: Whether the graph was changed.
+    """
+    a, b = np.where((g == -1) & (g.T == 1))  # a -> b
+    c = np.where(
+        ((g[b] == -1) & (g.T[b] == 1))  # b -> c
+        & ((g[a] == -1) & (g.T[a] == -1))  # a - c
+    )
+    # Extract actual indices
+    a, b, c = a[c[0]], b[c[0]], c[1]
+    # Orient as a -> c
+    g[c, a] = 1
+    # return whether graph changed
+    return len(a) > 0
+
+def _meek_rule3(g: np.ndarray, sep_set: dict[frozenset, list]) -> bool:
+    """
+    For a - b, a - c -> b and a - d -> b in g,
+    if g.sepset[c, d] exists and a in g.sepset[c, d], orient a -> b.
+    """
+    a, c = np.where((g == -1) & (g.T == -1))  # a - c
+    d = np.where(((g[a] == -1) & (g.T[a] == -1)) & (g[c] == 0))  # a - d -/- c
+    # Extract actual indices
+    a, c, d = a[d[0]], c[d[0]], d[1]
+    mask = c < d
+    a, c, d = a[mask], c[mask], d[mask]
+    b = np.where(
+        ((g[a] == -1) & (g.T[a] == -1))  # a - b
+        & ((g[c] == -1) & (g.T[c] == 1))  # c -> b
+        & ((g[d] == -1) & (g.T[d] == 1))  # d -> b
+    )
+    # Extract actual indices
+    a, c, d, b = a[b[0]], c[b[0]], d[b[0]], b[1]
+    # Orient as a -> b
+    changed = False
+    for a_, b_, c_, d_ in zip(a, b, c, d):
+        if frozenset((c_, d_)) in sep_set and all(
+            a_ in S for S in sep_set[frozenset((c_, d_))]
+        ):
+            g[b_, a_] = 1
+            changed = True
+    return changed
+
+
 def meek(g: np.ndarray, sep_set: dict[frozenset, list]) -> np.ndarray:
     """
     Orient the undirected edges in g by a revision of Meek's approach,
@@ -217,181 +298,128 @@ def meek(g: np.ndarray, sep_set: dict[frozenset, list]) -> np.ndarray:
         np.ndarray: The oriented graph.
     """
 
-    def rule1(g: np.ndarray, sep_set: dict[frozenset, list]) -> bool:
-        """
-        For (a -> b - c) in g,
-        if g.sepset[a, c] exists and b in g.sepset[a, c], orient b -> c.
-
-        Args:
-            g (np.ndarray): The graph to orient.
-        Returns:
-            bool: Whether the graph was changed.
-        """
-        a, b = np.where((g == -1) & (g.T == 1))  # a -> b
-        c = np.where(((g[b] == -1) & (g.T[b] == -1)) & (g[a] == 0))  # b - c  # a -/- c
-        # Extract actual indices
-        a, b, c = a[c[0]], b[c[0]], c[1]
-        # Orient as b -> c
-        changed = False
-        for a_, b_, c_ in zip(a, b, c):
-            if frozenset((a_, c_)) in sep_set and all(
-                b_ in S for S in sep_set[frozenset((a_, c_))]
-            ):
-                g[c_, b_] = 1
-                changed = True
-
-        return changed
-
-    def rule2(g: np.ndarray) -> bool:
-        """
-        For (a -> b -> c - a) in g, orient a -> c.
-        Args:
-            g (np.ndarray): The graph to orient.
-        Returns:
-            bool: Whether the graph was changed.
-        """
-        a, b = np.where((g == -1) & (g.T == 1))  # a -> b
-        c = np.where(
-            ((g[b] == -1) & (g.T[b] == 1))  # b -> c
-            & ((g[a] == -1) & (g.T[a] == -1))  # a - c
-        )
-        # Extract actual indices
-        a, b, c = a[c[0]], b[c[0]], c[1]
-        # Orient as a -> c
-        g[c, a] = 1
-        # return whether graph changed
-        return len(a) > 0
-
-    def rule3(g: np.ndarray, sep_set: dict[frozenset, list]) -> bool:
-        """
-        For a - b, a - c -> b and a - d -> b in g,
-        if g.sepset[c, d] exists and a in g.sepset[c, d], orient a -> b.
-        """
-        a, c = np.where((g == -1) & (g.T == -1))  # a - c
-        d = np.where(((g[a] == -1) & (g.T[a] == -1)) & (g[c] == 0))  # a - d -/- c
-        # Extract actual indices
-        a, c, d = a[d[0]], c[d[0]], d[1]
-        mask = c < d
-        a, c, d = a[mask], c[mask], d[mask]
-        b = np.where(
-            ((g[a] == -1) & (g.T[a] == -1))  # a - b
-            & ((g[c] == -1) & (g.T[c] == 1))  # c -> b
-            & ((g[d] == -1) & (g.T[d] == 1))  # d -> b
-        )
-        # Extract actual indices
-        a, c, d, b = a[b[0]], c[b[0]], d[b[0]], b[1]
-        # Orient as i -> l
-        changed = False
-        for a_, b_, c_, d_ in zip(a, b, c, d):
-            if frozenset((c_, d_)) in sep_set and all(
-                a_ in S for S in sep_set[frozenset((c_, d_))]
-            ):
-                g[b_, a_] = 1
-                changed = True
-        return changed
-
     g = g.copy()
-    while rule1(g, sep_set) or rule2(g) or rule3(g, sep_set):
+    while _meek_rule1(g, sep_set) or _meek_rule2(g) or _meek_rule3(g, sep_set):
         continue
     return g
 
 
-# Test stopping criterion
-def reach_with_undirected(g: np.ndarray, target: int) -> np.ndarray:
+def reach_with_undirected(g: np.ndarray, target: int) -> set[int]:
     """
-    Find all nodes that can reach the target node with an undirected path.
+    Find all nodes that can reach the target with undirected paths.
     Args:
         g (np.ndarray): The partially directed graph.
         target (int): The target node.
     Returns:
-        np.ndarray: An array of nodes that can reach the target node with an undirected path
+        set[int]: The set of nodes that can reach the target with undirected paths
     """
     undir = (g == -1) & (g.T == -1)
-    np.fill_diagonal(undir, 1)
-    reach = np.linalg.matrix_power(undir, undir.shape[0] - 1)
-    mask = reach[target] != 0
-    mask[target] = False
-    nodes = np.where(mask)[0]
-    return nodes
+
+    # BFS from target
+    visited = np.zeros(g.shape[0], dtype=bool)
+    visited[target] = True
+    queue = deque([target])
+
+    while queue:
+        node = queue.popleft()
+        # Get all undirected neighbors of current node
+        neighbors = np.where(undir[node])[0]
+        for nb in neighbors:
+            if not visited[nb]:
+                visited[nb] = True
+                queue.append(nb)
+
+    visited[target] = False
+    return set(np.where(visited)[0])
 
 
 # Main MB-by-MB algorithm
 def mb_by_mb(
-    data: np.ndarray,
-    ci_test: Callable[[int, int, list[int]], float],
+    nodes: set[int],
+    ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
     target: int,
     mb: dict[int, set] | None = None,
     L: dict[int, np.ndarray] | None = None,
     sep_set: dict[frozenset, list] | None = None,
+    ignore: set | None = None,
 ) -> np.ndarray:
     """
     MB-by-MB algorithm for learning the local network around a target node.
+    The graph has the following encoding:
+    - g[i, j] == -1, g[j, i] == -1 indicates an undirected edges i - j
+    - g[i, j] == -1, g[j, i] == 1 indicates a directed edge i -> j
+    - g[i, j] == 0, g[j, i] == 0 indicates no edge between i and j
 
     Args:
-        data (np.ndarray): The data matrix.
-        ci_test (Callable[[int, int, list[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
+        nodes (set): All nodes.
+        ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level.
         target (int): The target node for which to learn the local network.
         mb (dict[int, set]): Pre-computed Markov blankets of nodes.
         L (dict[int, np.ndarray]): Pre-computed local structures of nodes.
         sep_set (dict[frozenset, list]): Pre-computed separating sets.
+        ignore (set): Nodes to ignore.
     Returns:
         np.ndarray: The learned local network around the target node.
     """
-    mb = mb or dict()
-    L = L or dict()
-    sep_set = sep_set or defaultdict(list)
-    V = set(range(data.shape[1]))
+    if mb is None:
+        mb = {}
+    if L is None:
+        L = {}
+    if sep_set is None:
+        sep_set = {}
+    if ignore is None:
+        ignore = set()
 
     # 1. Initialization
     # Nodes whose MBs have been found
-    done_list = set()
+    done_set = set()
     # Nodes whose MBs will be found
-    wait_list = [target]
-    # The constructed local network around target
-    # with -1 for edge tail, 1 for edge head, and 0 for no edge
-    g = np.zeros((len(V), len(V)), dtype=int)
+    wait_queue = deque([target])
+    # The constructed local network around target with -1 for edge tail, 1 for edge head, and 0 for no edge
+    g = np.zeros((len(nodes), len(nodes)), dtype=int)
 
     # 2. Repeat
-    while len(wait_list) > 0:  # 7. Until wait_list is empty
-        # Take a node x from the head of wait_list
-        x = wait_list.pop(0)
+    while wait_queue:  # 7. Until wait_queue is empty
+        # Take a node x from the head of wait_queue
+        x = wait_queue.popleft()
         # Find mb[x]
         if x not in mb:
-            mb[x] = grow_shrink(V, x, ci_test, alpha)
+            mb[x] = grow_shrink(nodes - ignore, x, ci_test, alpha)
+        # Add [mb[x] \ done_set \ wait_queue] to the tail of wait_queue
+        wait_queue.extend(mb[x] - done_set - set(wait_queue))
+        # Add x to done_set
+        done_set.add(x)
+        # Define mb+(x)
         mb_x = mb[x].union({x})
-        # Add [mb[x] \ done_list \ wait_list] to the tail of wait_list
-        wait_list.extend([v for v in mb[x] if v not in list(done_list) + wait_list])
-        # Add x to done_list
-        done_list.add(x)
 
         # 3. Learn the local structure L[x] over mb+(x)
         # If L[x] is already learned, skip
         if x in L:
             pass
-        # If mb+(x) is a subset of mb+(n) for some n in done_list
+        # If mb+(x) is a subset of mb+(n) for some n in done_set
         elif (
-            n := next((n for n in done_list if n != x and mb_x < mb[n] | {n}), None)
+            n := next((n for n in done_set if n != x and mb_x <= mb[n] | {n}), None)
         ) is not None:
             # Set L[x] equal to the substructure of L[n] over mb+(x)
-            L[x] = copy_local_structure(L[n], mb_x)
-        # Else If mb(x) is a subset of done_list
-        elif mb[x] < done_list:
+            L[x] = copy_local_structure(L[n], list(mb_x))
+        # Else If mb(x) is a subset of done_set
+        elif mb[x] < done_set:
             # Set L[x] equal to the substructure of g over mb+(x)
-            L[x] = copy_local_structure(g, mb_x)
+            L[x] = copy_local_structure(g, list(mb_x))
         else:
-            # learn L[x] from observed data of mb[x]+
-            L[x] = learn_local_structure(V, mb_x, sep_set, ci_test, alpha)
+            # learn L[x] from observed data of mb+(x)
+            L[x] = learn_local_structure(nodes, mb_x, sep_set, ci_test, alpha)
 
         # 4. Put the edges connected to x and the v-structures containing x in L[x] to g
         g = update_graph(g, x, L[x])
         # 5. Orient undirected edges in G
         g = meek(g, sep_set)
 
-        # 6. Remove all nodes from wait_list whose paths to target in g are blocked by directed edges.
-        connected = reach_with_undirected(g, target)
-        wait_list = [w for w in wait_list if w in connected]
+        # 6. Remove all nodes from wait_queue whose paths to target in g are blocked by directed edges.
+        reachable = reach_with_undirected(g, target)
+        wait_queue = deque(v for v in wait_queue if v in reachable)
 
     # Output: the local network g around the target
     return g

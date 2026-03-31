@@ -1,10 +1,18 @@
-from collections import defaultdict
-from itertools import chain, combinations
+"""
+LOAD algorithm for optimal adjustment set discovery.
+
+Implements the Local Optimal Adjustments Discovery (LOAD) algorithm for finding
+optimal adjustment sets for causal effect estimation using local causal discovery.
+Reference: Schubert et al., "Local Causal Discovery for
+Statistically Efficient Causal Inference" (AISTATS 2026).
+"""
+
+from itertools import combinations
 from typing import Callable, NamedTuple, Sequence
 
 import numpy as np
 
-from mb_by_mb import mb_by_mb
+from .mb_by_mb import mb_by_mb
 
 
 class Neighbors(NamedTuple):
@@ -127,35 +135,35 @@ def get_locally_valid_parent_sets(g: np.ndarray, t: int, o: int) -> Sequence[set
     by Marloes H. Maathuis, Markus Kalisch and Peter Bühlmann
 
     Args:
-        g (np.ndarray): The local graph of x.
+        g (np.ndarray): The graph.
         t (int): The treatment node.
         o (int): The outcome node.
 
     Returns:
         Sequence[set[int]]: The locally valid parent sets.
     """
-    g = g.copy()
-    g[o, t] = 1  # orient edge from treatment to outcome
     neighbors = get_neighbors(g, t)
+    parents = neighbors.parents
+    siblings = neighbors.unoriented - {o}
+
+    # Save adjacencies
     skeleton = g != 0
     np.fill_diagonal(skeleton, True)
 
-    valid_sets = []
+    valid_sets = [parents]
     # for each subset of unoriented neighbors of the treatment
-    for new_parents in chain.from_iterable(
-        combinations(neighbors.unoriented, r)
-        for r in range(len(neighbors.unoriented) + 1)
-    ):
-        candidate_set = neighbors.parents.union(new_parents)
-        # Check if the candidate set is locally valid, i.e., has no NEW v-structure
-        # by checking if all NEW parents are neighbours of all current parents
-        if np.all(skeleton[new_parents, :][:, list(candidate_set)]):
-            valid_sets.append(candidate_set)
+    for l in range(1, len(siblings) + 1):
+        for new_parents in combinations(siblings, l):
+            candidate_parents = set(new_parents) | parents
+            # Check if the candidate set is locally valid, i.e., has no NEW v-structure
+            # by checking if all new parents are adjacent to all candidate parents
+            if np.all(skeleton[new_parents, :][:, list(candidate_parents)]):
+                valid_sets.append(candidate_parents)
     return valid_sets
 
 
 def load(
-    data: np.ndarray,
+    nodes: set[int],
     ci_test: Callable[[int, int, Sequence[int]], float],
     alpha: float,
     targets: Sequence[int],
@@ -164,23 +172,23 @@ def load(
     Optimal adjustment set discovery using local causal discovery algorithms.
 
     Args:
-        data (np.ndarray): The data matrix.
+        nodes (set): All nodes.
         ci_test (Callable[[int, int, Sequence[int]], float]): CI test taking x, y and a conditioning set, and returns a p-value.
         alpha (float): Significance level.
-        targets (Sequence[int]): The target nodes. If oracle is True, the first should be the treatment and the second the outcome.
+        targets (Sequence[int]): The target nodes.
     Returns:
         dict: Adjustment sets and a boolean indicating if the causal effect is identifiable.
     """
     MB = dict()
     L = dict()
     G = dict()
-    sep_set = defaultdict(list)
+    sep_set = dict()
     adj_sets = dict()
 
     # Step 1: Determine causal relations between targets
     t1, t2 = targets
-    G[t1] = mb_by_mb(data, ci_test, alpha, t1, MB, L, sep_set)
-    G[t2] = mb_by_mb(data, ci_test, alpha, t2, MB, L, sep_set)
+    G[t1] = mb_by_mb(nodes, ci_test, alpha, t1, MB, L, sep_set)
+    G[t2] = mb_by_mb(nodes, ci_test, alpha, t2, MB, L, sep_set)
 
     if is_explicit_ancestor(t1, t2, G[t1], ci_test, alpha):
         treatment, outcome = t1, t2
@@ -199,34 +207,23 @@ def load(
     # Step 2: Test identifiability of treatment on outcome
     siblings = get_neighbors(G[treatment], treatment).unoriented
     for v in siblings:
-        G[v] = mb_by_mb(data, ci_test, alpha, v, MB, L, sep_set)
+        G[v] = mb_by_mb(nodes, ci_test, alpha, v, MB, L, sep_set)
         if not is_amenable(treatment, outcome, v, G[v], ci_test, alpha):
-            adj_sets[(treatment, outcome)] = get_locally_valid_parent_sets(
-                G[treatment], treatment, outcome
-            )
+            local_sets = get_locally_valid_parent_sets(G[treatment], treatment, outcome)
+            adj_sets[(treatment, outcome)] = local_sets
             return {
                 "adj_sets": adj_sets,
                 "identifiable": False,
             }
 
-    # Step 3: Find explicit descendants of treatment
-    descendants = set()
-    for v in set(range(data.shape[1])) - {treatment, outcome}:
-        if is_explicit_ancestor(treatment, v, G[treatment], ci_test, alpha):
-            descendants.add(v)
+    # Step 3: Find possible descendants of treatment
+    poss_de = set()
+    for v in nodes - {treatment, outcome}:
+        if is_possible_ancestor(treatment, v, G[treatment], ci_test, alpha):
+            poss_de.add(v)
 
-    # Step 4: Find mediating nodes
-    mediators = set()
-    for v in descendants:
-        G[v] = mb_by_mb(data, ci_test, alpha, v, MB, L, sep_set)
-        if is_explicit_ancestor(v, outcome, G[v], ci_test, alpha):
-            mediators.add(v)
-
-    # Step 5: Identify optimal adjustment set
-    oset = set()
-    for v in mediators | {outcome}:
-        oset |= get_neighbors(G[v], v).parents
-    oset -= mediators | {treatment}
-
+    # Step 4: Identify optimal adjustment set via modified forbidden projection
+    G_TO = mb_by_mb(nodes, ci_test, alpha, outcome, ignore=poss_de)
+    oset = get_neighbors(G_TO, outcome).parents - {treatment}
     adj_sets[(treatment, outcome)] = [oset]
     return {"adj_sets": adj_sets, "identifiable": True}
